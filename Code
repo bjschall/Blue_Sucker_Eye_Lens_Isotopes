@@ -1,0 +1,448 @@
+library(readxl)
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+
+#DATA MANIPULATION
+#load data 
+load("Environment_BSR_Eye_Lens.RData")
+names(len)
+lens <- len %>% mutate(Diameter_mm=round(Diameter, 1)/1000, 
+                       Fish=str_extract(OtherID, "^[^_]+")) %>% 
+  rename(δ13C = `δ13C vs. VPDB`, δ15N=`δ15N vs. At. Air`)
+
+#filter down to outer diameter only
+dia<-lens %>% filter(Layer==1 & !is.na(Diameter_mm)) %>% 
+  mutate(Length_std = (Length - mean(Length))/sd(Length))
+
+unique(lens$Fish)                                          
+##################################################################################
+######  Evaluate the relationship between fish length and eye lens diameter ######
+##################################################################################
+#get prior
+get_prior(Diameter_mm ~ 0 + Intercept + Length, 
+          data = dia,
+          family = gaussian())
+
+#prior simulation
+priors <- tibble(Intercept = rnorm(100, .5, .5),
+                 beta = rnorm(100, .004, .004),
+                 iter = 1:100)
+
+#simulation plot
+prior_sims <- priors %>%
+  expand_grid(dia %>% distinct(Length)) %>%
+  mutate(sim = Intercept + beta*Length) 
+
+prior_sims %>% 
+  ggplot() +
+  geom_line(aes(x = Length, y = sim, group=iter))  
+
+###Linear model
+LenDia <- brm(Diameter_mm ~ 0 + Intercept + Length, 
+              data = dia,
+              prior= c(prior(normal(.5, .5), coef = "Intercept"),
+                       prior(normal(0.004, 0.004), coef = "Length"), 
+                       prior(exponential(1), class = "sigma")),
+              family = gaussian(),
+              file_refit = "on_change",
+              file="LenDia_mm.rds",
+              cores = 4, chains = 4, iter = 2000)
+#view model output and performance
+print(LenDia, digits=4)
+plot(LenDia)
+pp<-pp_check(LenDia, ndraws = 50); pp
+bayes_R2(LenDia)
+
+#posterior draws - create dataframe
+dat_new<-tibble(expand.grid(Length=seq(min(dia$Length), 
+                                         max(dia$Length), 
+                                         length.out=100)))
+
+#mean and 95% CrI
+dia_draws<-add_epred_draws(dat_new, LenDia, re_formula = NULL)
+
+summ1<-dia_draws %>% 
+  group_by(Length) %>% 
+  mean_qi(.epred);summ1
+
+#mean and 95% PI
+dia_drawsPI<-add_predicted_draws(dat_new, LenDia, re_formula = NULL)
+
+summ2<-dia_drawsPI %>% 
+  group_by(Length) %>% 
+  mean_qi(.prediction);summ2
+
+#final plot
+ggplot()+
+  geom_point(data=dia, aes(x=Length, y=Diameter_mm),shape=19,size=1.8, alpha=0.5)+
+  geom_line(data=summ1,aes(x=Length, y=.epred), linewidth=1)+
+  geom_ribbon(data=summ1,aes(x=Length, y=.epred,ymin=.lower, ymax=.upper), alpha=0.3)+
+  geom_ribbon(data=summ2, aes(x=Length, y=.prediction, ymin=.lower, ymax=.upper),alpha=0.2, col=NA)+ ##Prediction interval
+  theme_classic()+
+  xlab("Total length (mm)")+
+  ylab("Lens diameter (mm)")+
+  scale_x_continuous(limits=c(280, 880), breaks=seq(200,900,100))+
+  scale_y_continuous(limits=c(1.4,4.7), breaks=seq(1.5, 5.0, 0.5))+
+  scale_color_manual(values=c("black", "gray50"))+
+  theme(axis.title = element_text(size=18), 
+        axis.text = element_text(size=14),
+        legend.position.inside = 0)
+
+#ggsave("Figure1.Blue_Sucker_TL_vs_Diameter.jpeg", height=5, width=7, units="in", dpi=800)
+
+####################################################################################
+################  Use  eye lens diameters to estimate fish   #######################
+################      age and calculate year of cohort       #######################
+####################################################################################
+#prior simulation
+priors <- tibble(Intercept = rnorm(100, -3, 1.5),
+                 beta = rnorm(100, 1, .5),
+                 iter = 1:100)
+
+#simulation plot
+prior_sims <- priors %>%
+  expand_grid(dia %>% distinct(Diameter_mm)) %>%
+  mutate(sim = exp(Intercept + beta*Diameter_mm)) 
+
+prior_sims %>% 
+  ggplot() +
+  geom_line(aes(x = Diameter_mm, y = sim, group=iter))
+
+#get priors
+get_prior(Age_DateAdj_w_Preds ~ 0 + Intercept + (Diameter_mm), 
+    data = dia,
+    family = Gamma(link="log"))
+
+#Linear model
+AgeEst <- brm(Age_DateAdj_w_Preds ~ 0 + Intercept + (Diameter_mm), 
+              data = dia,
+              prior= c(prior(normal(-3, 1.5), coef = "Intercept"),
+                       prior(normal(1, 0.5), coef = "Diameter_mm"), 
+                       prior(exponential(1), class = "shape")),
+              family = Gamma(link="log"),
+              file_refit = "on_change",
+              file="AgeEst.rds",
+              cores = 4, chains = 4, iter = 2000)
+
+print(AgeEst, digits=3)
+plot(conditional_effects(AgeEst), points=T)
+pp2<-pp_check(AgeEst, ndraws = 100); pp2
+bayes_R2(AgeEst)
+
+#posterior draws - create dataframe
+dat_age<-tibble(expand.grid(Diameter_mm=distinct(filter(lens, Layer==1), Diameter_mm)))#outer diameter only
+
+dat_age_all<-tibble(expand.grid(Diameter_mm=distinct(lens, Diameter_mm))) #all diameters
+#mean and 95% CrI
+#outer diameter only
+AgeEst_draws<-add_epred_draws(dat_age, AgeEst, re_formula = NULL)
+
+summ_AgeEst<-AgeEst_draws %>% 
+  group_by(Diameter_mm) %>% 
+  mean_qi(.epred) %>% 
+  mutate(Age_estimate_diam = round(.epred,0));summ_AgeEst
+
+summ_AgeEst2 <- summ_AgeEst %>% select(Diameter_mm, Age_estimate_diam)
+
+#all layers
+AgeEst_draws2<-add_epred_draws(dat_age_all, AgeEst, re_formula = NULL)
+
+summ_AgeEst3<-AgeEst_draws2 %>% 
+  group_by(Diameter_mm) %>% 
+  mean_qi(.epred) %>% 
+  mutate(Age_estimate = round(.epred,0));summ_AgeEst
+
+summ_AgeEst4 <- summ_AgeEst3 %>% select(Diameter_mm, Age_estimate)
+
+lens3.1<-full_join(lens, summ_AgeEst2, by=c("Diameter_mm"))
+lens4 <- full_join(lens3.1, summ_AgeEst4, by=c("Diameter_mm"))
+
+#final plot
+ggplot()+
+  geom_point(data=dia, aes(x=Diameter_mm, y=Age_DateAdj_w_Preds),size=1.8, alpha=0.5)+
+  geom_line(data=summ_AgeEst, aes(x=Diameter_mm, y=.epred), linewidth=1)+
+  geom_ribbon(data=summ_AgeEst, aes(x=Diameter_mm, y=.epred,ymin=.lower, ymax=.upper), alpha=0.2)+
+  geom_rug(data=distinct(filter(lens, !is.na(Diameter_mm)), Diameter_mm), aes(x=Diameter_mm), alpha=0.3)+
+  theme_classic()+
+  xlab("Lens Diameter (mm)")+
+  ylab("Estimated age (years)")+
+  scale_x_continuous(limits=c(0.6,4.300))+
+  scale_color_manual(values=c("black", "gray50"))+
+  theme(axis.title = element_text(size=18), 
+        axis.text = element_text(size=14),
+        legend.position.inside = 0)
+
+#ggsave("Figure2.Blue_Sucker_Age_vs_Diameter.jpeg", height=5, width=7, units="in", dpi=800)
+
+##################################################################################
+###### Run General Additive Models to assess trends in isotopes by diameter ######
+##################################################################################
+#### Carbon GAM
+get_prior(`δ13C` ~ s(Diameter_mm),
+          data = lens,
+          family = gaussian())
+
+GAM_C <- brm(`δ13C` ~ s(Diameter_mm),
+            data = lens,
+            family = gaussian(),
+            prior = c(prior(normal(-25, 10), class = "Intercept"), 
+                      prior(normal(0, 10), class = "b"), 
+                      prior(exponential(0.1), class = "sds"), 
+                      prior(exponential(0.1), class = "sigma")),
+            file="GAM_C_mm.rds",
+            file_refit = "on_change",
+            control = list(adapt_delta = 0.99),
+            cores = 8, chains = 4, iter = 2000)
+
+#summarize output and graph
+summary(GAM_C)
+plot(conditional_effects(GAM_C,re_formula=NULL), points = TRUE)
+#check results
+pp_check(GAM_C, ndraws = 50)
+plot(GAM_C)
+
+#sample from the posterior
+dat_GAM <- tibble(Diameter_mm=filter(lens, !is.na(Diameter_mm))$Diameter_mm)
+GAM_C_draws<-add_epred_draws(dat_GAM, GAM_C, re_formula = NULL,)
+
+#summarize mean and 95% CrI
+summ_GAM_C <- GAM_C_draws %>% 
+  group_by(Diameter_mm) %>% 
+  mean_qi(.epred)
+
+#plot
+p1<-lens%>% group_by(Fish) %>% 
+  mutate(Fish_num = cur_group_id()) %>% #filter(Cohort>2004&Cohort<2019)%>% 
+  ggplot()+ #Carbon  
+  geom_line(aes(x=Diameter_mm, y=`δ13C`, group=Fish, col=Fish_num), linewidth=0.2)+ 
+  geom_point(aes(x=Diameter_mm, y=`δ13C`,col=Fish_num), size=0.5)+
+  theme_classic()+
+  scale_x_continuous(labels = NULL)+
+  scale_colour_gradient(low = "lightblue", high = "darkblue")+
+  xlab(NULL)+
+  ylab({delta}^13*C~'(\u2030)')+
+  guides(col="none")+
+  geom_line(data=summ_GAM_C, aes(x=Diameter_mm, y=.epred), linewidth=1)+
+  geom_ribbon(data=summ_GAM_C, aes(x=Diameter_mm, y=.epred, ymin=.lower, ymax=.upper),alpha=0.2, col=NA)+ ##Prediction interval
+  scale_y_continuous(limits = c(-32,-21), breaks=seq(-32,-22,2))+
+  theme(axis.title = element_text(size=18),
+        axis.text = element_text(size=14), 
+        axis.ticks.length=unit(.25, "cm")); p1
+
+#ggsave("FigureS2.Blue_Sucker_Recent_Carbon.jpeg", height=4, width=5, units="in", dpi=800)
+
+### Nitrogen GAM
+GAM_N <- brm(`δ15N` ~ s(Diameter_mm), 
+             data = lens,
+             family = gaussian(),
+             prior = c(prior(normal(15, 10), class = "Intercept"), 
+                       prior(normal(0, 10), class = "b"), 
+                       prior(exponential(0.1), class = "sds"), 
+                       prior(exponential(0.1), class = "sigma")),
+             file="GAM_N_mm.rds",
+             file_refit = "on_change",
+             control = list(adapt_delta = 0.99),
+             cores = 8, chains = 4, iter = 2000)
+
+#summarize output and graph
+summary(GAM_N)
+plot(conditional_effects(GAM_N,re_formula=NULL), points = TRUE)
+#check results
+pp_check(GAM_N, ndraws = 50)
+plot(GAM_N)
+
+#sample from the posterior (using same new data given above for GAM_C)
+GAM_N_draws<-add_epred_draws(dat_GAM, GAM_N, re_formula = NULL)
+
+#summarize mean and 95% CrI
+summ_GAM_N <- GAM_N_draws %>% 
+  group_by(Diameter_mm) %>% 
+  mean_qi(.epred)
+
+#plot
+p2<-lens %>% group_by(Fish) %>% 
+  mutate(Fish_num = cur_group_id()) %>%  #filter(Cohort>2004&Cohort<2019)%>%
+  ggplot()+ #Nitrogen
+  geom_line(aes(x=Diameter_mm, y=`δ15N`, group=Fish, col=Fish_num), size=0.2)+
+  geom_point(aes(x=Diameter_mm, y=`δ15N`,col=Fish_num), size=0.5)+
+  theme_classic()+
+  scale_colour_gradient(low = "lightblue", high = "darkblue")+
+  guides(col="none")+
+  geom_line(data=summ_GAM_N, aes(x=Diameter_mm, y=.epred), linewidth=1)+
+  geom_ribbon(data=summ_GAM_N, aes(x=Diameter_mm, y=.epred, ymin=.lower, ymax=.upper),alpha=0.2, col=NA)+ ##Prediction interval
+  xlab("Lens diameter (mm)")+
+  ylab({delta}^15*N~'(\u2030)')+
+  theme(axis.title = element_text(size=18),
+        axis.text = element_text(size=14), 
+        axis.ticks.length=unit(.25, "cm")); p2
+
+#stack plots into one figure
+GAM_plot_stack<-cowplot::align_plots(p1, p2, align="v", axis="l")
+cowplot::plot_grid(GAM_plot_stack[[1]], GAM_plot_stack[[2]], ncol = 1, rel_heights = c(0.48,0.52))
+
+#ggsave("Figure3.Blue_Sucker_Isotopes_vs_Diameter_GAM_stack.jpeg", height=8, width=5, units="in", dpi=800)
+
+###########################################################
+##Plot Carbon isotope by Cohort
+p3<-lens4 %>% filter(Age_estimate<2) %>% 
+  group_by(Fish, Cohort) %>% 
+  summarize(MeanCarbon=mean(`δ13C`), SDCarbon=sd(`δ13C`)) %>% 
+  ggplot(aes(x=Cohort, y=MeanCarbon))+
+  geom_errorbar(aes(ymin=MeanCarbon-SDCarbon, ymax=MeanCarbon+SDCarbon), 
+                position=position_dodge(width=0), width=0.5)+
+  geom_point(position=position_dodge(width = 0), alpha=0.5)+
+  ylim(-32,-22)+
+  ylab({delta}^13*C~'(\u2030)')+
+  xlab(NULL)+
+  scale_x_continuous(limits=c(1978,2025), labels=NULL)+
+  theme_classic()+
+  theme(axis.title = element_text(size=20), 
+        axis.text =  element_text(size=16),
+        axis.ticks.length=unit(.25, "cm"));p3
+  
+##Plot Nitrogen isotope by Cohort
+p4<-lens4 %>% filter(Age_estimate<2) %>% 
+  group_by(Fish, Cohort) %>% 
+  summarize(MeanNitrogen=mean(`δ15N`), SDNitrogen=sd(`δ15N`)) %>% 
+  ggplot(aes(x=Cohort, y=MeanNitrogen))+
+  geom_errorbar(aes(ymin=MeanNitrogen-SDNitrogen, ymax=MeanNitrogen+SDNitrogen), 
+                position=position_dodge(width=0), width=.5)+
+  geom_point(position=position_dodge(width = 0), alpha=0.5)+
+  xlim(1978,2025)+
+  ylim(9,18)+
+  ylab({delta}^15*N~'(\u2030)')+
+  xlab("Year")+
+  theme_classic()+
+  theme(axis.title = element_text(size=20), 
+        axis.text =  element_text(size=16),
+        axis.ticks.length=unit(.25, "cm"),
+        axis.title.y = element_text(vjust = 6));p4
+
+#stack plots
+cohort_plot_stack<-cowplot::align_plots(p3, p4, align="v", axis="l")
+cowplot::plot_grid(cohort_plot_stack[[1]], cohort_plot_stack[[2]], ncol = 1, rel_heights = c(0.48,0.52))
+
+#ggsave('Figure4.Age0and1_Isotopes_by_CohortYear_Stack.jpeg', width = 7, height=10, units="in",dpi = 800)
+
+####################################################################################
+##############  Linear models of isotopes by river discharge   #####################
+##############      using ages 0 & 1 and 2-year discharge      #####################
+####################################################################################
+##Add mean April 1-Oct 31 James River river discharge (Scotland Gage) from cohort year + age-1 year to data
+lens5 <- full_join(lens4, dis, by="Cohort")
+
+#summarize mean isotope values for all lens layers estimated to be from ages 0 and 1 
+lens6<-lens5 %>% filter(Age_estimate<2) %>% 
+  group_by(Fish, TwoYearAvgDisch) %>% 
+  summarize(MeanCarbon=mean(`δ13C`), SDCarbon=sd(`δ13C`), 
+            MeanNitrogen=mean(`δ15N`), SDNitrogen=sd(`δ15N`)); lens6
+
+### Model linear relationship between discharge and Carbon
+#get prior
+get_prior(MeanCarbon ~ TwoYearAvgDisch, 
+          data = lens6,
+          family = gaussian())
+
+#model
+Disch_C <- brm(MeanCarbon ~ TwoYearAvgDisch, 
+             data = lens6,
+             family = gaussian(),
+             prior = c(prior(normal(-27, 5), class = "Intercept"),
+                       prior(normal(0, 0.5), coef = "TwoYearAvgDisch"), 
+                       prior(exponential(1), class = "sigma")),
+             file_refit = "on_change",
+             file="Disch_C.rds",
+             cores = 8, chains = 4, iter = 2000)
+
+#summarize output and graph
+print(summary(Disch_C), digits=5)
+plot(conditional_effects(Disch_C,re_formula=NULL), points = TRUE)
+#check results
+pp_check(Disch_C, ndraws = 50)
+plot(Disch_C)
+
+#sample from the posterior 
+dat_disch <- tibble(TwoYearAvgDisch=seq(min(lens6$TwoYearAvgDisch), max(lens6$TwoYearAvgDisch), length.out=100))
+Disch_C_draws<-add_epred_draws(dat_disch, Disch_C, re_formula = NULL)
+
+#summarize mean and 95% CrI
+summ_Disch_C <- Disch_C_draws %>% 
+  group_by(TwoYearAvgDisch) %>% 
+  mean_qi(.epred)
+
+#Probability that the slope is negative
+Disch_C %>% spread_draws(b_TwoYearAvgDisch) %>% 
+  summarize(`Prob>0`=(sum(b_TwoYearAvgDisch<0))/4000)
+
+#Plot Carbon isotope by mean April 1-Oct 31 James River river discharge (Scotland Gage) from cohort year + age-1 year
+p5 <- lens6 %>% 
+  ggplot(aes(x=TwoYearAvgDisch, y=MeanCarbon))+
+  geom_errorbar(aes(ymin=MeanCarbon-SDCarbon, ymax=MeanCarbon+SDCarbon), width=2)+
+  geom_point(alpha=0.5)+
+  geom_line(data=summ_Disch_C, aes(x=TwoYearAvgDisch, y=.epred), linewidth=1)+
+  geom_ribbon(data=summ_Disch_C, aes(x=TwoYearAvgDisch, y=.epred, ymin=.lower, ymax=.upper), alpha=0.2)+
+  scale_x_continuous(limits=c(0,250),labels=NULL)+
+  ylim(-32,-22)+
+  ylab({delta}^13*C~'(\u2030)')+
+  xlab(NULL)+
+  theme_classic()+
+  theme(axis.title = element_text(size=20), 
+        axis.text =  element_text(size=16),
+        axis.ticks.length=unit(.15, "cm")); p5
+
+### Model linear relationship between discharge and Nitrogen
+#model
+Disch_N <- brm(MeanNitrogen ~ TwoYearAvgDisch, 
+               data = lens6,
+               family = gaussian(),
+               prior = c(prior(normal(14, 3), class = "Intercept"),
+                         prior(normal(0, 0.5), coef = "TwoYearAvgDisch"), 
+                         prior(exponential(1), class = "sigma")),
+               file_refit = "on_change",
+               file="Disch_N.rds",
+               cores = 8, chains = 4, iter = 2000)
+
+#summarize output and graph
+print(summary(Disch_N), digits=5)
+plot(conditional_effects(Disch_N,re_formula=NULL), points = TRUE)
+#check results
+pp_check(Disch_N, ndraws = 100)
+plot(Disch_N)
+
+#sample from the posterior (use same newdata as for carbon model)
+Disch_N_draws<-add_epred_draws(dat_disch, Disch_N, re_formula = NULL) 
+
+#summarize mean and 95% CrI
+summ_Disch_N <- Disch_N_draws %>% 
+  group_by(TwoYearAvgDisch) %>% 
+  mean_qi(.epred)
+
+#Probability that the slope is positive
+Disch_N %>% spread_draws(b_TwoYearAvgDisch) %>% 
+  summarize(`Prob>0`=(sum(b_TwoYearAvgDisch>0))/4000)
+
+##Plot Nitrogen isotope by mean April 1-Oct 31 James River river discharge (Scotland Gage) from cohort year + age-1 year
+p6<-lens6 %>%
+  ggplot(aes(x=TwoYearAvgDisch, y=MeanNitrogen))+
+  geom_errorbar(aes(ymin=MeanNitrogen-SDNitrogen, ymax=MeanNitrogen+SDNitrogen), 
+                position=position_dodge(width=0), width=2)+
+  geom_line(data=summ_Disch_N, aes(x=TwoYearAvgDisch, y=.epred), linewidth=1)+
+  geom_point(position=position_dodge(width = 0), alpha=0.5)+
+  geom_ribbon(data=summ_Disch_N, aes(x=TwoYearAvgDisch, y=.epred, ymin=.lower, ymax=.upper), alpha=0.2)+
+  xlim(0,250)+
+  scale_y_continuous(limits=c(9,17), breaks=seq(10,16,2))+
+  ylab({delta}^15*N~'(\u2030)')+
+  xlab(expression("Discharge ("*m^3*"/s)"))+
+  theme_classic()+
+  theme(axis.title = element_text(size=20), 
+        axis.text =  element_text(size=16),
+        axis.ticks.length=unit(.15, "cm"),
+        axis.title.y = element_text(vjust = 6));p6
+
+#stack plots
+cohort_plot_stack<-cowplot::align_plots(p5, p6, align="v", axis="l")
+cowplot::plot_grid(cohort_plot_stack[[1]], cohort_plot_stack[[2]], ncol = 1, rel_heights = c(0.48,0.52))
+
+#ggsave('Figure5.Age0and1_Isotopes_by_Discharge_Stack.jpeg', width = 7, height=10, units="in",dpi = 800)
